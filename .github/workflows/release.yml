@@ -5,6 +5,14 @@ on:
       - 'v*.*.*'
   workflow_dispatch:
 
+# The release is created on this repository with the default
+# GITHUB_TOKEN, which in orgs defaults to read-only — creating the
+# release and uploading assets both need contents write. Nothing in
+# this workflow publishes outside the repository: no crates.io, no
+# registries. `cargo xtask publish` exists but no workflow calls it.
+permissions:
+  contents: write
+
 jobs:
   create-release:
     runs-on: ubuntu-latest
@@ -179,7 +187,9 @@ jobs:
       - name: Build MSI installer
         if: runner.os == 'Windows'
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          # MSI ProductVersion must be numeric x.y.z — strip any semver
+          # build metadata (the fork versions as e.g. 0.44.3+red.1).
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value.Split('+')[0]
           New-Item -ItemType Directory -Force -Path target\wix
           wix build wix\main.wxs wix\Zellij.wxl `
             -d Version=$version `
@@ -375,7 +385,8 @@ jobs:
       - name: Build MSI installer (no-web)
         if: runner.os == 'Windows'
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          # Same build-metadata strip as the normal MSI job above.
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value.Split('+')[0]
           New-Item -ItemType Directory -Force -Path target\wix
           wix build wix\main.wxs wix\Zellij.wxl `
             -d Version=$version `

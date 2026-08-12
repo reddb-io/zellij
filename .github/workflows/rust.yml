@@ -2,9 +2,10 @@ name: Rust
 
 on:
   push:
-    branches: [main]
+    # red/** are this fork's release branches (upstream base + backports).
+    branches: [main, 'red/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'red/**']
   workflow_dispatch:
 
 env:
