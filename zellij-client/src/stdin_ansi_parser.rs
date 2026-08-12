@@ -156,15 +156,129 @@ impl HostReply {
     }
 }
 
+/// The shape of host reply a forwarded query is entitled to receive.
+///
+/// A forward slot is open for as long as it takes the host to answer,
+/// and the host's stdin is a shared channel: Zellij's own startup burst
+/// (256 `OSC 4` palette registers plus `OSC 10`/`OSC 11`), unsolicited
+/// theme notifications, and answers to queries Zellij issued for itself
+/// all arrive on the same wire. Without a correlation key every one of
+/// those bytes would be handed to whichever pane happened to have a
+/// forward in flight. This enum is that correlation key: it is derived
+/// from the forwarded query when the slot opens, and only replies it
+/// matches are accumulated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedReply {
+    /// `OSC 10 ; ?` → `OSC 10 ; <color>`.
+    ForegroundColor,
+    /// `OSC 11 ; ?` → `OSC 11 ; <color>`.
+    BackgroundColor,
+    /// `OSC 4 ; N ; ?` → `OSC 4 ; N ; <color>`. The register index is
+    /// part of the key: the startup burst answers all 256 registers and
+    /// only the one the pane asked for is its reply.
+    PaletteRegister(usize),
+    /// `CSI 14 t` → `CSI 4 ; H ; W t`.
+    TextAreaPixelSize,
+    /// `CSI 16 t` → `CSI 6 ; H ; W t`.
+    CharacterCellPixelSize,
+    /// `CSI ? 2026 $ p` → `CSI ? 2026 ; N $ y`.
+    SynchronizedOutput,
+    /// `CSI ? 996 n` → `CSI ? 997 ; N n`.
+    HostTerminalThemeMode,
+    /// The query did not match any shape this parser knows how to
+    /// correlate. Falls back to the pre-correlation behaviour of
+    /// capturing every reply until the barrier: a query kind added on
+    /// the server without a matching arm here still round-trips, at the
+    /// cost of the over-capture this enum exists to prevent.
+    Any,
+}
+
+impl ExpectedReply {
+    /// Derive the expected reply shape from the exact bytes the client
+    /// is about to write to the host terminal. The client has those
+    /// bytes in hand at `open_forward` time, so no separate channel is
+    /// needed to carry the query's identity alongside its token.
+    pub fn from_query_bytes(query_bytes: &[u8]) -> ExpectedReply {
+        lazy_static! {
+            static ref OSC4_QUERY_RE: Regex = Regex::new(r"^\u{1b}\]4;(\d+);\?").unwrap();
+        }
+        if query_bytes.starts_with(b"\x1b]10;?") {
+            return ExpectedReply::ForegroundColor;
+        }
+        if query_bytes.starts_with(b"\x1b]11;?") {
+            return ExpectedReply::BackgroundColor;
+        }
+        if let Some(caps) = std::str::from_utf8(query_bytes)
+            .ok()
+            .and_then(|s| OSC4_QUERY_RE.captures(s))
+        {
+            if let Ok(index) = caps[1].parse::<usize>() {
+                return ExpectedReply::PaletteRegister(index);
+            }
+        }
+        if query_bytes.starts_with(b"\x1b[14t") {
+            return ExpectedReply::TextAreaPixelSize;
+        }
+        if query_bytes.starts_with(b"\x1b[16t") {
+            return ExpectedReply::CharacterCellPixelSize;
+        }
+        if query_bytes.starts_with(b"\x1b[?2026$p") {
+            return ExpectedReply::SynchronizedOutput;
+        }
+        if query_bytes.starts_with(b"\x1b[?996n") {
+            return ExpectedReply::HostTerminalThemeMode;
+        }
+        log::warn!(
+            "forwarded query {:?} has no known reply shape; the forward slot will capture \
+             every host reply until the barrier",
+            String::from_utf8_lossy(query_bytes),
+        );
+        ExpectedReply::Any
+    }
+
+    /// Whether a reply event belongs to this query. `classified` is
+    /// `None` for reply-looking bytes the parser could not put into a
+    /// `HostReply` variant (an OSC Zellij does not model, say); those
+    /// can never be correlated, so only the `Any` fallback takes them.
+    fn captures(&self, classified: Option<&HostReply>) -> bool {
+        match (self, classified) {
+            (ExpectedReply::Any, _) => true,
+            (_, None) => false,
+            (ExpectedReply::ForegroundColor, Some(HostReply::ForegroundColor(_))) => true,
+            (ExpectedReply::BackgroundColor, Some(HostReply::BackgroundColor(_))) => true,
+            (ExpectedReply::PaletteRegister(want), Some(HostReply::ColorRegisters(registers))) => {
+                registers.iter().any(|(index, _)| index == want)
+            },
+            (ExpectedReply::TextAreaPixelSize, Some(HostReply::PixelDimensions(dims))) => {
+                dims.text_area_size.is_some()
+            },
+            (ExpectedReply::CharacterCellPixelSize, Some(HostReply::PixelDimensions(dims))) => {
+                dims.character_cell_size.is_some()
+            },
+            (ExpectedReply::SynchronizedOutput, Some(HostReply::SynchronizedOutput(_))) => true,
+            (
+                ExpectedReply::HostTerminalThemeMode,
+                Some(HostReply::HostTerminalThemeChanged(_)),
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 /// The "slot" tracking state for a single forwarded query currently in
-/// flight to the host terminal. The parser accumulates raw reply bytes
-/// into `reply_bytes` until it sees a Primary-DA (`c`) reply, which acts
-/// as the serializing barrier. The timer that enforces the 500 ms
-/// deadline lives on the forward-timeout runtime and owns its own
-/// wall-clock — the parser itself is deadline-agnostic.
+/// flight to the host terminal. The parser accumulates the raw bytes of
+/// replies matching `expected` into `reply_bytes` until it sees a
+/// Primary-DA (`c`) reply, which acts as the serializing barrier.
+/// Replies that do not match still take the normal classification path
+/// into `ParseOutput::replies` — they refine Zellij's own cached view of
+/// the host — they just don't get written into a pane that never asked
+/// for them. The timer that enforces the 500 ms deadline lives on the
+/// forward-timeout runtime and owns its own wall-clock — the parser
+/// itself is deadline-agnostic.
 #[derive(Debug, Clone)]
 pub struct ForwardSlot {
     pub token: u32,
+    pub expected: ExpectedReply,
     pub reply_bytes: Vec<u8>,
 }
 
@@ -262,10 +376,12 @@ impl StdinAnsiParser {
         }
     }
 
-    /// Open a forwarding window for `token`. Subsequent reply events that
-    /// arrive before the Primary-DA barrier will be accumulated into the
-    /// slot's `reply_bytes`, in addition to being dispatched as normal
-    /// classified `HostReply` events.
+    /// Open a forwarding window for `token`, carrying the exact query
+    /// bytes about to be written to the host. Reply events arriving
+    /// before the Primary-DA barrier that correlate with that query are
+    /// accumulated into the slot's `reply_bytes`, in addition to being
+    /// dispatched as normal classified `HostReply` events; everything
+    /// else only takes the classification path.
     ///
     /// The server serializes forwarded queries globally (`forward_in_flight`
     /// on `Screen`), so in a well-behaved session this is only ever called
@@ -273,7 +389,7 @@ impl StdinAnsiParser {
     /// or a race that reached through: debug builds panic so bugs surface
     /// during testing, release builds log and clobber the previous slot
     /// (whose accumulated bytes would otherwise silently leak).
-    pub fn open_forward(&mut self, token: u32) {
+    pub fn open_forward(&mut self, token: u32, query_bytes: &[u8]) {
         debug_assert!(
             self.active_forward.is_none(),
             "open_forward({}) called while slot for token {:?} is still active",
@@ -291,6 +407,7 @@ impl StdinAnsiParser {
         }
         self.active_forward = Some(ForwardSlot {
             token,
+            expected: ExpectedReply::from_query_bytes(query_bytes),
             reply_bytes: Vec::new(),
         });
     }
@@ -342,18 +459,25 @@ impl StdinAnsiParser {
                     // the keyboard parser runs. Other OSCs are
                     // classified into `HostReply` for cached-state
                     // refinement.
-                    if payload.starts_with(b"99;") {
+                    let classified = if payload.starts_with(b"99;") {
                         out.desktop_notifications
                             .push(payload.get(3..).unwrap_or_default().to_vec());
-                    } else if let Some(reply) = HostReply::from_osc_payload(&payload) {
-                        out.replies.push(reply);
-                    }
+                        None
+                    } else {
+                        let classified = HostReply::from_osc_payload(&payload);
+                        if let Some(reply) = classified.clone() {
+                            out.replies.push(reply);
+                        }
+                        classified
+                    };
                     if let Some(slot) = self.active_forward.as_mut() {
-                        // Re-serialize so the pane's pty sees a legal OSC.
-                        // Terminators vary by host; ST (ESC \) is always safe.
-                        slot.reply_bytes.extend_from_slice(b"\x1b]");
-                        slot.reply_bytes.extend_from_slice(&payload);
-                        slot.reply_bytes.extend_from_slice(b"\x1b\\");
+                        if slot.expected.captures(classified.as_ref()) {
+                            // Re-serialize so the pane's pty sees a legal OSC.
+                            // Terminators vary by host; ST (ESC \) is always safe.
+                            slot.reply_bytes.extend_from_slice(b"\x1b]");
+                            slot.reply_bytes.extend_from_slice(&payload);
+                            slot.reply_bytes.extend_from_slice(b"\x1b\\");
+                        }
                     }
                 },
                 InputEvent::DeviceControlReply {
@@ -373,11 +497,14 @@ impl StdinAnsiParser {
                             // no cached-state counterpart.
                         },
                         _ => {
-                            if let Some(reply) = HostReply::from_csi_report(&raw) {
+                            let classified = HostReply::from_csi_report(&raw);
+                            if let Some(reply) = classified.clone() {
                                 out.replies.push(reply);
                             }
                             if let Some(slot) = self.active_forward.as_mut() {
-                                slot.reply_bytes.extend_from_slice(&raw);
+                                if slot.expected.captures(classified.as_ref()) {
+                                    slot.reply_bytes.extend_from_slice(&raw);
+                                }
                             }
                             // Suppress unused-variable warning for params.
                             let _ = params;

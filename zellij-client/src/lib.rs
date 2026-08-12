@@ -1215,9 +1215,15 @@ pub fn start_client(
                 }
             },
             ClientInstruction::ForwardQueryToHost { token, query_bytes } => {
-                // 1. Open a forwarding window on the parser so any reply
-                //    events that arrive before the barrier are captured.
-                stdin_ansi_parser.lock().unwrap().open_forward(token);
+                // 1. Open a forwarding window on the parser, keyed by the
+                //    query itself so only its own reply is captured —
+                //    the host's stdin also carries Zellij's own startup
+                //    palette burst and unsolicited notifications, which
+                //    the querying pane must never receive.
+                stdin_ansi_parser
+                    .lock()
+                    .unwrap()
+                    .open_forward(token, &query_bytes);
                 // 2. Spawn a per-forward timer on the dedicated async
                 //    runtime. When the deadline fires, the task closes
                 //    the slot (if it's still open for this token) and
