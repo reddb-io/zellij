@@ -5,6 +5,14 @@ on:
       - 'v*.*.*'
   workflow_dispatch:
 
+# The release is created on this repository with the default
+# GITHUB_TOKEN, which in orgs defaults to read-only — creating the
+# release and uploading assets both need contents write. Nothing in
+# this workflow publishes outside the repository: no crates.io, no
+# registries. `cargo xtask publish` exists but no workflow calls it.
+permissions:
+  contents: write
+
 jobs:
   create-release:
     runs-on: ubuntu-latest
