@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
-* fix: forward OSC7 (cwd changes) to host terminal (https://github.com/zellij-org/zellij/pull/4867)
+
+## [0.46.0+red.1] - 2026-09-16
+* fork release tracking upstream 0.46.0 (up to https://github.com/zellij-org/zellij/pull/4867)
+* feat: forward OSC7 (cwd changes) to host terminal (https://github.com/zellij-org/zellij/pull/4867)
+* feat: allow starting a session with an initial command, eg. `zellij attach -a my-session -- htop` (https://github.com/zellij-org/zellij/pull/5543)
+* feat: allow setting explicit_theme_hue (light/dark) (https://github.com/zellij-org/zellij/pull/5536)
+* fix: release a CLI pipe when the plugin handling it crashes, instead of blocking the `zellij pipe` client until the plugin is unloaded (https://github.com/zellij-org/zellij/pull/5537)
+* fix(web-client): coalesce concurrent authentication onto a single prompt (https://github.com/zellij-org/zellij/pull/5542)
+* fix: input mode updates when switching tabs (https://github.com/zellij-org/zellij/pull/5535)
+* fix: properly fire visibility event to plugins when their floating-layer is hidden/shown (https://github.com/zellij-org/zellij/pull/5534)
 
 ## [0.45.1] - 2026-08-28
 * fix: nested-session detection over SSH (https://github.com/zellij-org/zellij/pull/5522)

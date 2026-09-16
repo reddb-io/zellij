@@ -68,8 +68,12 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/zellij-org/zellij"
-version = "0.46.0"
+    repository = "https://github.com/zellij-org/zellij"
+    # Build metadata marks reddb-io fork builds so `zellij --version` can
+    # tell a fork binary from stock upstream. The `+red.N` part is ignored
+    # by cargo's dependency resolution, so the path deps above still match.
+    # Bump the `.N` on every fork release.
+    version = "0.46.0+red.1"
 # NOTE: When updating this, modify `channel` in `rust-toolchain.toml` accordingly
 rust-version = "1.95"
 
