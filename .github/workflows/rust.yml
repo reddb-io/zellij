@@ -2,18 +2,129 @@ name: Rust
 
 on:
   workflow_dispatch:
+    inputs:
+      preview_platforms:
+        type: boolean
+        description: Show selected platforms without running builds, tests or publication
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
+  ENABLE_LINUX_X64: ${{ vars.ENABLE_LINUX_X64 || 'true' }}
+  ENABLE_LINUX_ARM64: ${{ vars.ENABLE_LINUX_ARM64 || 'true' }}
+  ENABLE_WINDOWS_X64: ${{ vars.ENABLE_WINDOWS_X64 || 'true' }}
+  ENABLE_WINDOWS_ARM64: ${{ vars.ENABLE_WINDOWS_ARM64 || 'false' }}
+  ENABLE_MACOS_X64: ${{ vars.ENABLE_MACOS_X64 || 'false' }}
+  ENABLE_MACOS_ARM64: ${{ vars.ENABLE_MACOS_ARM64 || 'false' }}
+  ENABLE_LINUX_ARMV7: ${{ vars.ENABLE_LINUX_ARMV7 || 'false' }}
+  ENABLE_LINUX_X86: ${{ vars.ENABLE_LINUX_X86 || 'false' }}
 jobs:
+  platforms:
+    name: Select platforms
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      linux_x64: ${{ steps.select.outputs.linux_x64 }}
+      linux_arm64: ${{ steps.select.outputs.linux_arm64 }}
+      windows_x64: ${{ steps.select.outputs.windows_x64 }}
+      windows_arm64: ${{ steps.select.outputs.windows_arm64 }}
+      macos_x64: ${{ steps.select.outputs.macos_x64 }}
+      macos_arm64: ${{ steps.select.outputs.macos_arm64 }}
+      linux_armv7: ${{ steps.select.outputs.linux_armv7 }}
+      linux_x86: ${{ steps.select.outputs.linux_x86 }}
+      any: ${{ steps.select.outputs.any }}
+      docker_platforms: ${{ steps.select.outputs.docker_platforms }}
+      matrix_build: ${{ steps.select.outputs.matrix_build }}
+      enabled_build: ${{ steps.select.outputs.enabled_build }}
+      matrix_test: ${{ steps.select.outputs.matrix_test }}
+      enabled_test: ${{ steps.select.outputs.enabled_test }}
+      matrix_integration-test: ${{ steps.select.outputs.matrix_integration-test }}
+      enabled_integration-test: ${{ steps.select.outputs.enabled_integration-test }}
+    steps:
+      - id: select
+        name: Filter platforms before allocating runners
+        shell: python
+        env:
+          PLATFORM_DEFAULTS: '{"linux_x64":true,"linux_arm64":true,"windows_x64":true,"windows_arm64":false,"macos_x64":false,"macos_arm64":false,"linux_armv7":false,"linux_x86":false}'
+          PLATFORM_AVAILABLE: '["linux_x64", "macos_arm64", "windows_x64"]'
+          PLATFORM_MATRICES: |
+            {
+              "build": [
+                {
+                  "flag": "linux_x64",
+                  "row": {
+                    "os": "ubuntu-latest"
+                  }
+                },
+                {
+                  "flag": "macos_arm64",
+                  "row": {
+                    "os": "macos-latest"
+                  }
+                }
+              ],
+              "test": [
+                {
+                  "flag": "linux_x64",
+                  "row": {
+                    "os": "ubuntu-latest"
+                  }
+                },
+                {
+                  "flag": "macos_arm64",
+                  "row": {
+                    "os": "macos-latest"
+                  }
+                }
+              ],
+              "integration-test": [
+                {
+                  "flag": "linux_x64",
+                  "row": {
+                    "os": "ubuntu-latest"
+                  }
+                }
+              ]
+            }
+        run: |
+          import json
+          import os
+
+          defaults = json.loads(os.environ["PLATFORM_DEFAULTS"])
+          enabled = {}
+          for key in defaults:
+              name = "ENABLE_" + key.upper()
+              value = os.environ[name].lower()
+              if value not in ("true", "false"):
+                  raise SystemExit(f"{name} must be true or false, got {value!r}")
+              enabled[key] = value == "true"
+
+          matrices = json.loads(os.environ["PLATFORM_MATRICES"])
+          available = json.loads(os.environ["PLATFORM_AVAILABLE"])
+          output = {key: str(value).lower() for key, value in enabled.items()}
+          output["any"] = str(any(enabled[key] for key in available)).lower()
+          for job, entries in matrices.items():
+              selected = [entry["row"] for entry in entries if enabled[entry["flag"]]]
+              output["enabled_" + job] = str(bool(selected)).lower()
+              # A placeholder keeps GitHub's matrix schema valid when the job is skipped.
+              output["matrix_" + job] = json.dumps({"include": selected or [entries[0]["row"]]}, separators=(",", ":"))
+          docker = [target for key, target in (("linux_x64", "linux/amd64"), ("linux_arm64", "linux/arm64")) if enabled[key]]
+          output["docker_platforms"] = ",".join(docker)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              for key, value in output.items():
+                  handle.write(f"{key}={value}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write("### Selected platforms\n\n")
+              for key in available:
+                  handle.write(f"- {key}: {str(enabled[key]).lower()}\n")
   build:
     name: Build
 
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix_build) }}
 
     runs-on: ${{ matrix.os }}
 
@@ -33,6 +144,9 @@ jobs:
       - name: Build
         run: cargo xtask build
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.enabled_build == 'true') }}
   build-windows:
     name: Build (Windows)
     runs-on: windows-latest
@@ -57,13 +171,15 @@ jobs:
       - name: Build
         run: cargo xtask build
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.windows_x64 == 'true') }}
   test:
     name: Test
 
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix_test) }}
 
     runs-on: ${{ matrix.os }}
 
@@ -83,6 +199,9 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.enabled_test == 'true') }}
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest
@@ -109,13 +228,15 @@ jobs:
       - name: Test zellij-client
         run: cargo test --no-default-features -p zellij-client --lib
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.windows_x64 == 'true') }}
   integration-test:
     name: Integration Test
 
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix_integration-test) }}
 
     runs-on: ${{ matrix.os }}
 
@@ -140,6 +261,9 @@ jobs:
       - name: Run whole-app integration tests
         run: cargo xtask integration-test
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.enabled_integration-test == 'true') }}
   test-no-web:
     name: Test (No Web)
     runs-on: ubuntu-latest
@@ -160,6 +284,9 @@ jobs:
       - name: Test without web support
         run: cargo xtask test --no-web
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.linux_x64 == 'true') }}
   assets:
     name: Check Bundled Assets
     runs-on: ubuntu-latest
@@ -178,6 +305,9 @@ jobs:
       - name: Check bundled assets
         run: cargo xtask assets --check
 
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.linux_x64 == 'true') }}
   format:
     name: Check Formatting
     runs-on: ubuntu-latest
@@ -192,3 +322,6 @@ jobs:
 
       - name: Check Format
         run: cargo xtask format --check
+    needs:
+      - platforms
+    if: ${{ !inputs.preview_platforms && (needs.platforms.outputs.linux_x64 == 'true') }}
